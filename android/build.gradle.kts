@@ -1,4 +1,4 @@
-group = "com.yourcompany.flutter_ble_core"
+group = "com.github.sethu1107.flutter_ble_core"
 version = "1.0-SNAPSHOT"
 
 buildscript {
@@ -26,7 +26,7 @@ plugins {
 }
 
 android {
-    namespace = "com.yourcompany.flutter_ble_core"
+    namespace = "com.github.sethu1107.flutter_ble_core"
 
     compileSdk = 36
 

@@ -1,4 +1,4 @@
-package com.yourcompany.flutter_ble_core
+package com.github.sethu1107.flutter_ble_core
 
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel

@@ -13,10 +13,18 @@ class BleConnection: NSObject, CBPeripheralDelegate {
     private var connectedPeripherals: [String: CBPeripheral] = [:]
 
     private var pendingConnects: [String: FlutterResult] = [:]
+    private var pendingConnectTimeouts: [String: DispatchWorkItem] = [:]
+    private var pendingDisconnects: [String: FlutterResult] = [:]
+    private var pendingDisconnectTimeouts: [String: DispatchWorkItem] = [:]
     private var pendingServiceDiscovery: [String: FlutterResult] = [:]
     private var pendingServiceCounts: [String: Int] = [:]
     private var pendingReads: [String: FlutterResult] = [:]
     private var pendingWrites: [String: FlutterResult] = [:]
+
+    // Writes without response can outrun CoreBluetooth's internal transmit
+    // buffer; when canSendWriteWithoutResponse is false we queue here and
+    // drain from peripheralIsReady(toSendWriteWithoutResponse:).
+    private var writeWithoutResponseQueues: [String: [(CBCharacteristic, Data, FlutterResult)]] = [:]
 
     init(central: CBCentralManager, onEvent: @escaping ([String: Any]) -> Void) {
         self.central = central
@@ -42,14 +50,40 @@ class BleConnection: NSObject, CBPeripheralDelegate {
         peripheral.delegate = self
         connectedPeripherals[deviceId] = peripheral
         pendingConnects[deviceId] = result
+
+        let timeoutWork = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.pendingConnectTimeouts.removeValue(forKey: deviceId)
+            guard let pending = self.pendingConnects.removeValue(forKey: deviceId) else { return }
+            self.central.cancelPeripheralConnection(peripheral)
+            self.connectedPeripherals.removeValue(forKey: deviceId)
+            pending(FlutterError(code: "timeout", message: "Timed out connecting to \(deviceId)", details: nil))
+        }
+        pendingConnectTimeouts[deviceId] = timeoutWork
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.connectTimeoutSeconds, execute: timeoutWork)
+
         central.connect(peripheral, options: nil)
     }
 
+    /// Resolves once the platform confirms disconnection, not merely once it's requested.
     func disconnect(deviceId: String, result: @escaping FlutterResult) {
-        if let peripheral = connectedPeripherals[deviceId] {
-            central.cancelPeripheralConnection(peripheral)
+        guard let peripheral = connectedPeripherals[deviceId] else {
+            result(nil)
+            return
         }
-        result(nil)
+
+        pendingDisconnects[deviceId] = result
+        let timeoutWork = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.pendingDisconnectTimeouts.removeValue(forKey: deviceId)
+            guard let pending = self.pendingDisconnects.removeValue(forKey: deviceId) else { return }
+            self.connectedPeripherals.removeValue(forKey: deviceId)
+            pending(FlutterError(code: "timeout", message: "Timed out disconnecting from \(deviceId)", details: nil))
+        }
+        pendingDisconnectTimeouts[deviceId] = timeoutWork
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.disconnectTimeoutSeconds, execute: timeoutWork)
+
+        central.cancelPeripheralConnection(peripheral)
     }
 
     func discoverServices(deviceId: String, result: @escaping FlutterResult) {
@@ -59,6 +93,28 @@ class BleConnection: NSObject, CBPeripheralDelegate {
         }
         pendingServiceDiscovery[deviceId] = result
         peripheral.discoverServices(nil)
+    }
+
+    /// CoreBluetooth negotiates the ATT MTU automatically at connect time; there is no
+    /// API to request a specific value on iOS. This reports the value already in effect.
+    func requestMtu(deviceId: String, result: @escaping FlutterResult) {
+        guard let peripheral = connectedPeripherals[deviceId] else {
+            result(FlutterError(code: "connectionFailed", message: "Device not connected", details: nil))
+            return
+        }
+        result(peripheral.maximumWriteValueLength(for: .withoutResponse) + 3)
+    }
+
+    /// CoreBluetooth has no connection-priority API — the OS manages connection
+    /// interval/latency automatically. This is a no-op that resolves immediately
+    /// once the device is known to be connected, mirroring how other BLE plugins
+    /// treat this call on iOS.
+    func requestConnectionPriority(deviceId: String, result: @escaping FlutterResult) {
+        guard connectedPeripherals[deviceId] != nil else {
+            result(FlutterError(code: "connectionFailed", message: "Device not connected", details: nil))
+            return
+        }
+        result(nil)
     }
 
     func readCharacteristic(deviceId: String, serviceUuid: String, characteristicUuid: String, result: @escaping FlutterResult) {
@@ -91,13 +147,17 @@ class BleConnection: NSObject, CBPeripheralDelegate {
             return
         }
 
-        let writeType: CBCharacteristicWriteType = withResponse ? .withResponse : .withoutResponse
         if withResponse {
             pendingWrites[key(deviceId, characteristic)] = result
+            peripheral.writeValue(value, for: characteristic, type: .withResponse)
+            return
         }
-        peripheral.writeValue(value, for: characteristic, type: writeType)
-        if !withResponse {
+
+        if peripheral.canSendWriteWithoutResponse {
+            peripheral.writeValue(value, for: characteristic, type: .withoutResponse)
             result(nil)
+        } else {
+            writeWithoutResponseQueues[deviceId, default: []].append((characteristic, value, result))
         }
     }
 
@@ -116,13 +176,21 @@ class BleConnection: NSObject, CBPeripheralDelegate {
             result(FlutterError(code: "characteristicNotFound", message: "Characteristic not found", details: nil))
             return
         }
+        // CoreBluetooth chooses notify vs. indicate automatically based on the
+        // characteristic's properties, unlike Android where the CCCD value must
+        // be picked explicitly.
         peripheral.setNotifyValue(enabled, for: characteristic)
         result(nil)
     }
 
     func disconnectAll() {
+        pendingConnectTimeouts.values.forEach { $0.cancel() }
+        pendingConnectTimeouts.removeAll()
+        pendingDisconnectTimeouts.values.forEach { $0.cancel() }
+        pendingDisconnectTimeouts.removeAll()
         connectedPeripherals.values.forEach { central.cancelPeripheralConnection($0) }
         connectedPeripherals.removeAll()
+        writeWithoutResponseQueues.removeAll()
     }
 
     // MARK: - Central manager driven lifecycle
@@ -130,6 +198,8 @@ class BleConnection: NSObject, CBPeripheralDelegate {
     func handleConnected(peripheral: CBPeripheral) {
         let deviceId = peripheral.identifier.uuidString
         onEvent(BleUtils.event("connectionState", ["deviceId": deviceId, "state": "connected"]))
+
+        pendingConnectTimeouts.removeValue(forKey: deviceId)?.cancel()
         if let result = pendingConnects.removeValue(forKey: deviceId) {
             result(nil)
         }
@@ -138,17 +208,41 @@ class BleConnection: NSObject, CBPeripheralDelegate {
     func handleFailedToConnect(peripheral: CBPeripheral, error: Error?) {
         let deviceId = peripheral.identifier.uuidString
         connectedPeripherals.removeValue(forKey: deviceId)
+
+        pendingConnectTimeouts.removeValue(forKey: deviceId)?.cancel()
         if let result = pendingConnects.removeValue(forKey: deviceId) {
-            result(FlutterError(code: "connectionFailed", message: error?.localizedDescription, details: nil))
+            result(
+                FlutterError(
+                    code: "connectionFailed", message: error?.localizedDescription, details: Self.platformCode(error)))
         } else {
             onEvent(BleUtils.errorEvent("connectionFailed", error?.localizedDescription))
         }
     }
 
-    func handleDisconnected(peripheral: CBPeripheral) {
+    func handleDisconnected(peripheral: CBPeripheral, error: Error? = nil) {
         let deviceId = peripheral.identifier.uuidString
         connectedPeripherals.removeValue(forKey: deviceId)
         onEvent(BleUtils.event("connectionState", ["deviceId": deviceId, "state": "disconnected"]))
+
+        pendingConnectTimeouts.removeValue(forKey: deviceId)?.cancel()
+        if let result = pendingConnects.removeValue(forKey: deviceId) {
+            result(
+                FlutterError(
+                    code: "connectionFailed", message: "Disconnected before connect completed",
+                    details: Self.platformCode(error)))
+        }
+
+        pendingDisconnectTimeouts.removeValue(forKey: deviceId)?.cancel()
+        if let result = pendingDisconnects.removeValue(forKey: deviceId) {
+            result(nil)
+        }
+
+        if let queue = writeWithoutResponseQueues.removeValue(forKey: deviceId) {
+            for (_, _, pendingResult) in queue {
+                pendingResult(
+                    FlutterError(code: "connectionFailed", message: "Device disconnected before write completed", details: nil))
+            }
+        }
     }
 
     // MARK: - CBPeripheralDelegate
@@ -159,7 +253,9 @@ class BleConnection: NSObject, CBPeripheralDelegate {
 
         if let error = error {
             pendingServiceDiscovery.removeValue(forKey: deviceId)
-            result(FlutterError(code: "operationFailed", message: error.localizedDescription, details: nil))
+            result(
+                FlutterError(
+                    code: "operationFailed", message: error.localizedDescription, details: Self.platformCode(error)))
             return
         }
 
@@ -205,7 +301,9 @@ class BleConnection: NSObject, CBPeripheralDelegate {
 
         if let result = pendingReads.removeValue(forKey: characteristicKey) {
             if let error = error {
-                result(FlutterError(code: "operationFailed", message: error.localizedDescription, details: nil))
+                result(
+                    FlutterError(
+                        code: "operationFailed", message: error.localizedDescription, details: Self.platformCode(error)))
             } else {
                 result([UInt8](characteristic.value ?? Data()))
             }
@@ -235,10 +333,24 @@ class BleConnection: NSObject, CBPeripheralDelegate {
         guard let result = pendingWrites.removeValue(forKey: key(deviceId, characteristic)) else { return }
 
         if let error = error {
-            result(FlutterError(code: "operationFailed", message: error.localizedDescription, details: nil))
+            result(
+                FlutterError(
+                    code: "operationFailed", message: error.localizedDescription, details: Self.platformCode(error)))
         } else {
             result(nil)
         }
+    }
+
+    func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        let deviceId = peripheral.identifier.uuidString
+        guard var queue = writeWithoutResponseQueues[deviceId], !queue.isEmpty else { return }
+
+        while !queue.isEmpty, peripheral.canSendWriteWithoutResponse {
+            let (characteristic, value, result) = queue.removeFirst()
+            peripheral.writeValue(value, for: characteristic, type: .withoutResponse)
+            result(nil)
+        }
+        writeWithoutResponseQueues[deviceId] = queue
     }
 
     // MARK: - Helpers
@@ -254,4 +366,15 @@ class BleConnection: NSObject, CBPeripheralDelegate {
         let serviceUuid = characteristic.service?.uuid.uuidString ?? ""
         return "\(deviceId)|\(serviceUuid)|\(characteristic.uuid.uuidString)"
     }
+
+    /// CoreBluetooth's error codes (CBError/CBATTError domains) use a different
+    /// numbering scheme than Android's raw GATT status ints — this is not the
+    /// same "133/8/22" scale, just the closest thing iOS exposes.
+    private static func platformCode(_ error: Error?) -> Int? {
+        guard let error = error else { return nil }
+        return (error as NSError).code
+    }
+
+    private static let connectTimeoutSeconds: TimeInterval = 10
+    private static let disconnectTimeoutSeconds: TimeInterval = 5
 }

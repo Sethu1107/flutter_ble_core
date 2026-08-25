@@ -1,4 +1,4 @@
-package com.yourcompany.flutter_ble_core
+package com.github.sethu1107.flutter_ble_core
 
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothGatt
@@ -7,6 +7,8 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothProfile
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import io.flutter.plugin.common.MethodChannel.Result
 import java.util.UUID
 
@@ -16,17 +18,41 @@ class BleConnection(
     private val adapter: BluetoothAdapter,
     private val onEvent: (Map<String, Any?>) -> Unit,
 ) {
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     private val gattMap = mutableMapOf<String, BluetoothGatt>()
+    private val pendingConnects = mutableMapOf<String, Result>()
+    private val pendingConnectTimeouts = mutableMapOf<String, Runnable>()
+    private val pendingDisconnects = mutableMapOf<String, Result>()
+    private val pendingDisconnectTimeouts = mutableMapOf<String, Runnable>()
     private val pendingServiceDiscovery = mutableMapOf<String, Result>()
     private val pendingReads = mutableMapOf<String, Result>()
     private val pendingWrites = mutableMapOf<String, Result>()
+    private val pendingMtu = mutableMapOf<String, Result>()
 
     fun connect(deviceId: String, result: Result) {
         try {
             val device = adapter.getRemoteDevice(deviceId)
             val gatt = device.connectGatt(context, false, gattCallback(deviceId))
             gattMap[deviceId] = gatt
-            result.success(null)
+            pendingConnects[deviceId] = result
+
+            val timeoutRunnable =
+                Runnable {
+                    pendingConnectTimeouts.remove(deviceId)
+                    val pending = pendingConnects.remove(deviceId) ?: return@Runnable
+                    gattMap.remove(deviceId)?.let {
+                        try {
+                            it.disconnect()
+                            it.close()
+                        } catch (e: SecurityException) {
+                            // Best-effort cleanup.
+                        }
+                    }
+                    pending.error("timeout", "Timed out connecting to $deviceId", null)
+                }
+            pendingConnectTimeouts[deviceId] = timeoutRunnable
+            mainHandler.postDelayed(timeoutRunnable, CONNECT_TIMEOUT_MS)
         } catch (e: IllegalArgumentException) {
             result.error("connectionFailed", "Invalid device id: $deviceId", null)
         } catch (e: SecurityException) {
@@ -34,18 +60,38 @@ class BleConnection(
         }
     }
 
+    /** Resolves once the platform confirms disconnection, not merely once it's requested. */
     fun disconnect(deviceId: String, result: Result) {
-        val gatt = gattMap.remove(deviceId)
-        if (gatt != null) {
-            try {
-                gatt.disconnect()
-                gatt.close()
-            } catch (e: SecurityException) {
-                result.error("permissionDenied", e.message, null)
-                return
-            }
+        val gatt = gattMap[deviceId]
+        if (gatt == null) {
+            result.success(null)
+            return
         }
-        result.success(null)
+
+        pendingDisconnects[deviceId] = result
+        val timeoutRunnable =
+            Runnable {
+                pendingDisconnectTimeouts.remove(deviceId)
+                val pending = pendingDisconnects.remove(deviceId) ?: return@Runnable
+                gattMap.remove(deviceId)?.let {
+                    try {
+                        it.close()
+                    } catch (e: SecurityException) {
+                        // Best-effort cleanup.
+                    }
+                }
+                pending.error("timeout", "Timed out disconnecting from $deviceId", null)
+            }
+        pendingDisconnectTimeouts[deviceId] = timeoutRunnable
+        mainHandler.postDelayed(timeoutRunnable, DISCONNECT_TIMEOUT_MS)
+
+        try {
+            gatt.disconnect()
+        } catch (e: SecurityException) {
+            clearPendingDisconnect(deviceId)
+            pendingDisconnects.remove(deviceId)
+            result.error("permissionDenied", e.message, null)
+        }
     }
 
     fun discoverServices(deviceId: String, result: Result) {
@@ -55,6 +101,36 @@ class BleConnection(
             gatt.discoverServices()
         } catch (e: SecurityException) {
             pendingServiceDiscovery.remove(deviceId)
+            result.error("permissionDenied", e.message, null)
+        }
+    }
+
+    fun requestMtu(deviceId: String, mtu: Int, result: Result) {
+        val gatt = gattMap[deviceId] ?: return result.error("connectionFailed", "Device not connected", null)
+        pendingMtu[deviceId] = result
+        try {
+            if (!gatt.requestMtu(mtu)) {
+                pendingMtu.remove(deviceId)
+                result.error("operationFailed", "MTU request rejected", null)
+            }
+        } catch (e: SecurityException) {
+            pendingMtu.remove(deviceId)
+            result.error("permissionDenied", e.message, null)
+        }
+    }
+
+    /// [priority] is one of [android.bluetooth.BluetoothGatt]'s CONNECTION_PRIORITY_* constants.
+    /// There's no callback for this on Android — it's fire-and-forget, so success just
+    /// means the request was accepted, not that the link parameters actually changed.
+    fun requestConnectionPriority(deviceId: String, priority: Int, result: Result) {
+        val gatt = gattMap[deviceId] ?: return result.error("connectionFailed", "Device not connected", null)
+        try {
+            if (gatt.requestConnectionPriority(priority)) {
+                result.success(null)
+            } else {
+                result.error("operationFailed", "Connection priority request rejected", null)
+            }
+        } catch (e: SecurityException) {
             result.error("permissionDenied", e.message, null)
         }
     }
@@ -120,11 +196,18 @@ class BleConnection(
             gatt.setCharacteristicNotification(characteristic, enabled)
             val cccd = characteristic.getDescriptor(CCCD_UUID)
             if (cccd != null) {
+                // Some peripherals only expose INDICATE (no NOTIFY) and reject the
+                // notification CCCD value in that case, so pick indicate when it's
+                // the only option.
+                val indicateOnly =
+                    characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY == 0 &&
+                        characteristic.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
+
                 cccd.value =
-                    if (enabled) {
-                        BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    } else {
-                        BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+                    when {
+                        !enabled -> BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+                        indicateOnly -> BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                        else -> BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                     }
                 gatt.writeDescriptor(cccd)
             }
@@ -135,6 +218,10 @@ class BleConnection(
     }
 
     fun disconnectAll() {
+        pendingConnectTimeouts.values.forEach { mainHandler.removeCallbacks(it) }
+        pendingConnectTimeouts.clear()
+        pendingDisconnectTimeouts.values.forEach { mainHandler.removeCallbacks(it) }
+        pendingDisconnectTimeouts.clear()
         gattMap.values.forEach {
             try {
                 it.disconnect()
@@ -144,6 +231,14 @@ class BleConnection(
             }
         }
         gattMap.clear()
+    }
+
+    private fun clearPendingConnect(deviceId: String) {
+        pendingConnectTimeouts.remove(deviceId)?.let { mainHandler.removeCallbacks(it) }
+    }
+
+    private fun clearPendingDisconnect(deviceId: String) {
+        pendingDisconnectTimeouts.remove(deviceId)?.let { mainHandler.removeCallbacks(it) }
     }
 
     private fun findCharacteristic(
@@ -170,6 +265,11 @@ class BleConnection(
                     }
                 onEvent(BleUtils.event("connectionState", mapOf("deviceId" to deviceId, "state" to state)))
 
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    clearPendingConnect(deviceId)
+                    pendingConnects.remove(deviceId)?.success(null)
+                }
+
                 if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     try {
                         gatt.close()
@@ -177,13 +277,23 @@ class BleConnection(
                         // Ignore; the connection is already gone.
                     }
                     gattMap.remove(deviceId)
+
+                    clearPendingConnect(deviceId)
+                    pendingConnects.remove(deviceId)?.error(
+                        "connectionFailed",
+                        "Disconnected before connect completed (status $status)",
+                        status,
+                    )
+
+                    clearPendingDisconnect(deviceId)
+                    pendingDisconnects.remove(deviceId)?.success(null)
                 }
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
                 val result = pendingServiceDiscovery.remove(deviceId) ?: return
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    result.error("operationFailed", "Service discovery failed with status $status", null)
+                    result.error("operationFailed", "Service discovery failed with status $status", status)
                     return
                 }
                 val services =
@@ -213,7 +323,7 @@ class BleConnection(
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     result.success(BleUtils.bytesToIntList(characteristic.value))
                 } else {
-                    result.error("operationFailed", "Read failed with status $status", null)
+                    result.error("operationFailed", "Read failed with status $status", status)
                 }
             }
 
@@ -226,7 +336,7 @@ class BleConnection(
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     result.success(null)
                 } else {
-                    result.error("operationFailed", "Write failed with status $status", null)
+                    result.error("operationFailed", "Write failed with status $status", status)
                 }
             }
 
@@ -243,9 +353,20 @@ class BleConnection(
                     ),
                 )
             }
+
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                val result = pendingMtu.remove(deviceId) ?: return
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    result.success(mtu)
+                } else {
+                    result.error("operationFailed", "MTU negotiation failed with status $status", status)
+                }
+            }
         }
 
     companion object {
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private const val CONNECT_TIMEOUT_MS = 10_000L
+        private const val DISCONNECT_TIMEOUT_MS = 5_000L
     }
 }

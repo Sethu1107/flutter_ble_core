@@ -41,7 +41,8 @@ public class FlutterBleCorePlugin: NSObject, FlutterPlugin, FlutterStreamHandler
             initialize(result: result)
 
         case "startScan":
-            withReady(result) { self.scanner!.start(); result(nil) }
+            let serviceUuids = args?["serviceUuids"] as? [String] ?? []
+            withReady(result) { self.scanner!.start(serviceUuids: serviceUuids); result(nil) }
 
         case "stopScan":
             withReady(result) { self.scanner!.stop(); result(nil) }
@@ -57,6 +58,14 @@ public class FlutterBleCorePlugin: NSObject, FlutterPlugin, FlutterStreamHandler
         case "discoverServices":
             guard let deviceId = args?["deviceId"] as? String else { return missingArg(result, "deviceId") }
             withReady(result) { self.connection!.discoverServices(deviceId: deviceId, result: result) }
+
+        case "requestMtu":
+            guard let deviceId = args?["deviceId"] as? String else { return missingArg(result, "deviceId") }
+            withReady(result) { self.connection!.requestMtu(deviceId: deviceId, result: result) }
+
+        case "requestConnectionPriority":
+            guard let deviceId = args?["deviceId"] as? String else { return missingArg(result, "deviceId") }
+            withReady(result) { self.connection!.requestConnectionPriority(deviceId: deviceId, result: result) }
 
         case "readCharacteristic":
             guard let deviceId = args?["deviceId"] as? String,
@@ -165,6 +174,6 @@ public class FlutterBleCorePlugin: NSObject, FlutterPlugin, FlutterStreamHandler
     public func centralManager(
         _ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?
     ) {
-        connection?.handleDisconnected(peripheral: peripheral)
+        connection?.handleDisconnected(peripheral: peripheral, error: error)
     }
 }

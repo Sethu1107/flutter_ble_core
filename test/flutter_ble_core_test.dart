@@ -23,6 +23,37 @@ void main() {
     });
   });
 
+  group('BleScanResult.fromMap', () {
+    test('parses manufacturer data and service UUIDs', () {
+      final result = BleScanResult.fromMap({
+        'id': 'AA:BB:CC:DD:EE:FF',
+        'name': 'Lock',
+        'rssi': -54,
+        'manufacturerData': {
+          76: [1, 2, 3],
+        },
+        'serviceUuids': ['0000180f-0000-1000-8000-00805f9b34fb'],
+      });
+
+      expect(result.device.id, 'AA:BB:CC:DD:EE:FF');
+      expect(result.rssi, -54);
+      expect(result.manufacturerData, hasLength(1));
+      expect(result.manufacturerData[76], [1, 2, 3]);
+      expect(result.serviceUuids, ['0000180f-0000-1000-8000-00805f9b34fb']);
+    });
+
+    test('defaults manufacturer data and service UUIDs when absent', () {
+      final result = BleScanResult.fromMap({
+        'id': 'AA:BB:CC:DD:EE:FF',
+        'name': 'Lock',
+        'rssi': -54,
+      });
+
+      expect(result.manufacturerData, isEmpty);
+      expect(result.serviceUuids, isEmpty);
+    });
+  });
+
   group('BleService.fromMap', () {
     test('parses nested characteristics', () {
       final service = BleService.fromMap({

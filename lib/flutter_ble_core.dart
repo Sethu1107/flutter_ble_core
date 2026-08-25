@@ -7,6 +7,7 @@ export 'src/models/ble_characteristic.dart';
 
 export 'src/enums/bluetooth_state.dart';
 export 'src/enums/ble_connection_state.dart';
+export 'src/enums/ble_connection_priority.dart';
 
 export 'src/exceptions/ble_exception.dart';
 

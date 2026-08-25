@@ -27,7 +27,7 @@ flutter:
   plugin:
     platforms:
       android:
-        package: com.yourcompany.flutter_ble_core
+        package: com.github.sethu1107.flutter_ble_core
         pluginClass: FlutterBleCorePlugin
       ios:
         pluginClass: FlutterBleCorePlugin
