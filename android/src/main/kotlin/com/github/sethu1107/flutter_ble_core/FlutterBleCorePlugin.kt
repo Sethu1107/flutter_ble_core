@@ -3,11 +3,14 @@ package com.github.sethu1107.flutter_ble_core
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothManager
+import android.bluetooth.le.ScanSettings
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
@@ -29,6 +32,10 @@ class FlutterBleCorePlugin :
     private var connection: BleConnection? = null
     private var adapter: BluetoothAdapter? = null
     private var stateReceiver: BroadcastReceiver? = null
+
+    // Lazy so plain-JVM unit tests that construct FlutterBleCorePlugin() without an Android
+    // runtime don't crash on Looper.getMainLooper() before any event is ever emitted.
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         context = binding.applicationContext
@@ -56,8 +63,11 @@ class FlutterBleCorePlugin :
         eventSink = null
     }
 
+    // Called from various callback threads (ScanCallback, BluetoothGattCallback,
+    // BroadcastReceiver) as well as the main thread — EventSink.success() is only
+    // valid on the main thread, so always post there rather than calling directly.
     private fun emit(event: Map<String, Any?>) {
-        eventSink?.success(event)
+        mainHandler.post { eventSink?.success(event) }
     }
 
     override fun onMethodCall(call: MethodCall, result: Result) {
@@ -67,12 +77,21 @@ class FlutterBleCorePlugin :
                 "startScan" ->
                     withReady(result) {
                         val serviceUuids = call.argument<List<String>>("serviceUuids") ?: emptyList()
-                        scanner!!.start(serviceUuids)
+                        val scanMode = scanModeFromString(call.argument<String>("scanMode"))
+                        scanner!!.start(serviceUuids, scanMode)
                         result.success(null)
                     }
                 "stopScan" -> withReady(result) { scanner!!.stop(); result.success(null) }
-                "connect" -> withReady(result) { connection!!.connect(requireArg(call, "deviceId"), result) }
-                "disconnect" -> withReady(result) { connection!!.disconnect(requireArg(call, "deviceId"), result) }
+                "connect" ->
+                    withReady(result) {
+                        val timeoutMs = call.argument<Int>("timeoutMs")?.toLong() ?: DEFAULT_CONNECT_TIMEOUT_MS
+                        connection!!.connect(requireArg(call, "deviceId"), timeoutMs, result)
+                    }
+                "disconnect" ->
+                    withReady(result) {
+                        val timeoutMs = call.argument<Int>("timeoutMs")?.toLong() ?: DEFAULT_DISCONNECT_TIMEOUT_MS
+                        connection!!.disconnect(requireArg(call, "deviceId"), timeoutMs, result)
+                    }
                 "discoverServices" ->
                     withReady(result) {
                         connection!!.discoverServices(requireArg(call, "deviceId"), result)
@@ -188,4 +207,18 @@ class FlutterBleCorePlugin :
             "lowPower" -> BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER
             else -> BluetoothGatt.CONNECTION_PRIORITY_BALANCED
         }
+
+    private fun scanModeFromString(value: String?): Int =
+        when (value) {
+            "lowPower" -> ScanSettings.SCAN_MODE_LOW_POWER
+            "balanced" -> ScanSettings.SCAN_MODE_BALANCED
+            else -> ScanSettings.SCAN_MODE_LOW_LATENCY
+        }
+
+    companion object {
+        // Only used if the Dart side omits timeoutMs — BleManager always sends one,
+        // these exist purely so a stale/mismatched Dart binary doesn't crash the call.
+        private const val DEFAULT_CONNECT_TIMEOUT_MS = 10_000L
+        private const val DEFAULT_DISCONNECT_TIMEOUT_MS = 5_000L
+    }
 }

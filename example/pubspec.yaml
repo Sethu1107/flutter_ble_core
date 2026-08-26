@@ -29,6 +29,11 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
 
+  # Requests the runtime Bluetooth/location permissions the OS requires
+  # before a scan will actually return results. Only the example app needs
+  # this — flutter_ble_core itself stays permission-request-free by design.
+  permission_handler: ^12.0.1
+
 dev_dependencies:
   integration_test:
     sdk: flutter

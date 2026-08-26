@@ -5,6 +5,8 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
 import java.util.UUID
 
@@ -13,6 +15,9 @@ class BleScanner(
     private val adapter: BluetoothAdapter,
     private val onEvent: (Map<String, Any?>) -> Unit,
 ) {
+    // ScanCallback fires on a Binder thread; the `scanning` flag is also read/written
+    // from start()/stop() on the main thread, so mutate it there too.
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
     private var scanning = false
 
     private val scanCallback =
@@ -46,12 +51,14 @@ class BleScanner(
             }
 
             override fun onScanFailed(errorCode: Int) {
-                scanning = false
-                onEvent(BleUtils.errorEvent("scanFailed", "Scan failed with code $errorCode"))
+                mainHandler.post {
+                    scanning = false
+                    onEvent(BleUtils.errorEvent("scanFailed", "Scan failed with code $errorCode"))
+                }
             }
         }
 
-    fun start(serviceUuids: List<String>) {
+    fun start(serviceUuids: List<String>, scanMode: Int = ScanSettings.SCAN_MODE_LOW_LATENCY) {
         val leScanner = adapter.bluetoothLeScanner
         if (leScanner == null) {
             onEvent(BleUtils.errorEvent("bluetoothUnavailable", "BLE scanner unavailable"))
@@ -59,10 +66,7 @@ class BleScanner(
         }
         if (scanning) return
 
-        val settings =
-            ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                .build()
+        val settings = ScanSettings.Builder().setScanMode(scanMode).build()
 
         val filters =
             serviceUuids.mapNotNull { uuid ->

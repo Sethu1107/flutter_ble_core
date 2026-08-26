@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_ble_core/flutter_ble_core.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 void main() {
   runApp(const MyApp());
@@ -38,6 +39,14 @@ class _MyAppState extends State<MyApp> {
   }
 
   Future<void> _init() async {
+    final granted = await _requestPermissions();
+    if (!granted) {
+      _showError(
+        'Bluetooth/location permission denied — scanning will find nothing '
+        'until granted in system settings.',
+      );
+    }
+
     try {
       await _ble.initialize();
     } on BleException catch (e) {
@@ -71,6 +80,20 @@ class _MyAppState extends State<MyApp> {
         isError: false,
       );
     });
+  }
+
+  /// Requests everything a BLE scan needs to actually return results:
+  /// - Android 12+: BLUETOOTH_SCAN / BLUETOOTH_CONNECT
+  /// - Android <=11: location, or scans silently return zero results
+  /// - iOS: the Bluetooth authorization prompt (driven by Info.plist)
+  Future<bool> _requestPermissions() async {
+    final statuses = await [
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.locationWhenInUse,
+      Permission.bluetooth,
+    ].request();
+    return statuses.values.every((status) => status.isGranted || status.isLimited);
   }
 
   Future<void> _toggleScan() async {

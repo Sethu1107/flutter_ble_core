@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'config/ble_config.dart';
 import 'enums/ble_connection_priority.dart';
 import 'enums/ble_connection_state.dart';
+import 'enums/ble_scan_mode.dart';
 import 'enums/bluetooth_state.dart';
 import 'exceptions/ble_exception.dart';
 import 'models/ble_scan_result.dart';
@@ -67,9 +68,12 @@ class BleManager {
   Future<void> initialize() async {
     if (_initialized) return;
 
-    await _invoke('initialize');
+    // Must subscribe before invoking 'initialize' — the native side emits the
+    // first bluetoothState event synchronously from inside that call, and if
+    // nothing is listening on the EventChannel yet, that event is lost for good.
     _eventSubscription ??=
         _eventChannel.receiveBroadcastStream().listen(_handleEvent);
+    await _invoke('initialize');
     _initialized = true;
   }
 
@@ -79,14 +83,20 @@ class BleManager {
   /// least one of those services — pushing the filter into the native
   /// scanner instead of scanning everything and discarding client-side.
   /// [timeout], if given, calls [stopScan] automatically after the duration.
+  /// [scanMode] trades off discovery speed against power use (Android only —
+  /// see [BleScanMode]).
   Future<void> startScan({
     List<String> serviceUuids = const [],
     Duration? timeout,
+    BleScanMode scanMode = BleScanMode.lowLatency,
   }) async {
     _scanTimeoutTimer?.cancel();
     _scanTimeoutTimer = null;
 
-    await _invoke('startScan', {'serviceUuids': serviceUuids});
+    await _invoke('startScan', {
+      'serviceUuids': serviceUuids,
+      'scanMode': scanMode.name,
+    });
 
     if (timeout != null) {
       _scanTimeoutTimer = Timer(timeout, stopScan);
@@ -101,10 +111,12 @@ class BleManager {
 
   /// Connects to [deviceId].
   ///
+  /// [config].connectTimeout bounds how long to wait for the platform to
+  /// confirm the connection before failing with [BleErrorCode.timeout].
   /// When [config].autoReconnect is set, an unexpected disconnect (i.e. one
   /// not caused by calling [disconnect]) triggers automatic reconnect
   /// attempts, up to [BleConfig.maxReconnectAttempts], spaced by
-  /// [BleConfig.reconnectDelay].
+  /// [BleConfig.reconnectDelay] and using the same [config].connectTimeout.
   Future<void> connect(String deviceId, {BleConfig config = const BleConfig()}) {
     if (config.autoReconnect) {
       _autoReconnectConfigs[deviceId] = config;
@@ -112,13 +124,25 @@ class BleManager {
       _autoReconnectConfigs.remove(deviceId);
     }
     _reconnectAttempts[deviceId] = 0;
-    return _invoke('connect', {'deviceId': deviceId});
+    return _invoke('connect', {
+      'deviceId': deviceId,
+      'timeoutMs': config.connectTimeout.inMilliseconds,
+    });
   }
 
-  Future<void> disconnect(String deviceId) {
+  /// Disconnects from [deviceId]. [timeout] bounds how long to wait for the
+  /// platform to confirm disconnection before failing with
+  /// [BleErrorCode.timeout].
+  Future<void> disconnect(
+    String deviceId, {
+    Duration timeout = const Duration(seconds: 5),
+  }) {
     _autoReconnectConfigs.remove(deviceId);
     _reconnectAttempts.remove(deviceId);
-    return _invoke('disconnect', {'deviceId': deviceId});
+    return _invoke('disconnect', {
+      'deviceId': deviceId,
+      'timeoutMs': timeout.inMilliseconds,
+    });
   }
 
   Future<List<BleService>> discoverServices(String deviceId) async {
@@ -267,7 +291,10 @@ class BleManager {
       // Cancelled (disconnect()/connect() called again) while we waited.
       if (!_autoReconnectConfigs.containsKey(deviceId)) return;
       try {
-        await _invoke('connect', {'deviceId': deviceId});
+        await _invoke('connect', {
+          'deviceId': deviceId,
+          'timeoutMs': config.connectTimeout.inMilliseconds,
+        });
       } catch (_) {
         _maybeReconnect(deviceId);
       }

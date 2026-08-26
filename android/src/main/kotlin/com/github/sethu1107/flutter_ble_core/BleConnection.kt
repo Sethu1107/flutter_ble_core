@@ -18,7 +18,7 @@ class BleConnection(
     private val adapter: BluetoothAdapter,
     private val onEvent: (Map<String, Any?>) -> Unit,
 ) {
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
     private val gattMap = mutableMapOf<String, BluetoothGatt>()
     private val pendingConnects = mutableMapOf<String, Result>()
@@ -30,7 +30,7 @@ class BleConnection(
     private val pendingWrites = mutableMapOf<String, Result>()
     private val pendingMtu = mutableMapOf<String, Result>()
 
-    fun connect(deviceId: String, result: Result) {
+    fun connect(deviceId: String, timeoutMs: Long, result: Result) {
         try {
             val device = adapter.getRemoteDevice(deviceId)
             val gatt = device.connectGatt(context, false, gattCallback(deviceId))
@@ -52,7 +52,7 @@ class BleConnection(
                     pending.error("timeout", "Timed out connecting to $deviceId", null)
                 }
             pendingConnectTimeouts[deviceId] = timeoutRunnable
-            mainHandler.postDelayed(timeoutRunnable, CONNECT_TIMEOUT_MS)
+            mainHandler.postDelayed(timeoutRunnable, timeoutMs)
         } catch (e: IllegalArgumentException) {
             result.error("connectionFailed", "Invalid device id: $deviceId", null)
         } catch (e: SecurityException) {
@@ -61,7 +61,7 @@ class BleConnection(
     }
 
     /** Resolves once the platform confirms disconnection, not merely once it's requested. */
-    fun disconnect(deviceId: String, result: Result) {
+    fun disconnect(deviceId: String, timeoutMs: Long, result: Result) {
         val gatt = gattMap[deviceId]
         if (gatt == null) {
             result.success(null)
@@ -83,7 +83,7 @@ class BleConnection(
                 pending.error("timeout", "Timed out disconnecting from $deviceId", null)
             }
         pendingDisconnectTimeouts[deviceId] = timeoutRunnable
-        mainHandler.postDelayed(timeoutRunnable, DISCONNECT_TIMEOUT_MS)
+        mainHandler.postDelayed(timeoutRunnable, timeoutMs)
 
         try {
             gatt.disconnect()
@@ -253,65 +253,20 @@ class BleConnection(
     private fun key(deviceId: String, characteristic: BluetoothGattCharacteristic) =
         "$deviceId|${characteristic.service.uuid}|${characteristic.uuid}"
 
+    // BluetoothGattCallback methods fire on a Binder thread, not the main thread — but
+    // MethodChannel.Result/EventChannel.EventSink calls are only valid on the main thread,
+    // and the pending* maps are plain HashMaps shared with onMethodCall (which runs on the
+    // main thread). Every override posts its body to mainHandler so callbacks are handled
+    // on the same thread as everything else, avoiding both an illegal-thread Result call
+    // (which silently leaves the Dart Future to time out) and a data race on the maps.
     private fun gattCallback(deviceId: String) =
         object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-                val state =
-                    when (newState) {
-                        BluetoothProfile.STATE_CONNECTING -> "connecting"
-                        BluetoothProfile.STATE_CONNECTED -> "connected"
-                        BluetoothProfile.STATE_DISCONNECTING -> "disconnecting"
-                        else -> "disconnected"
-                    }
-                onEvent(BleUtils.event("connectionState", mapOf("deviceId" to deviceId, "state" to state)))
-
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    clearPendingConnect(deviceId)
-                    pendingConnects.remove(deviceId)?.success(null)
-                }
-
-                if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    try {
-                        gatt.close()
-                    } catch (e: SecurityException) {
-                        // Ignore; the connection is already gone.
-                    }
-                    gattMap.remove(deviceId)
-
-                    clearPendingConnect(deviceId)
-                    pendingConnects.remove(deviceId)?.error(
-                        "connectionFailed",
-                        "Disconnected before connect completed (status $status)",
-                        status,
-                    )
-
-                    clearPendingDisconnect(deviceId)
-                    pendingDisconnects.remove(deviceId)?.success(null)
-                }
+                mainHandler.post { handleConnectionStateChange(deviceId, gatt, status, newState) }
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                val result = pendingServiceDiscovery.remove(deviceId) ?: return
-                if (status != BluetoothGatt.GATT_SUCCESS) {
-                    result.error("operationFailed", "Service discovery failed with status $status", status)
-                    return
-                }
-                val services =
-                    gatt.services.map { service ->
-                        mapOf(
-                            "uuid" to service.uuid.toString(),
-                            "characteristics" to
-                                service.characteristics.map { c ->
-                                    mapOf(
-                                        "uuid" to c.uuid.toString(),
-                                        "canRead" to BleUtils.canRead(c),
-                                        "canWrite" to BleUtils.canWrite(c),
-                                        "canNotify" to BleUtils.canNotify(c),
-                                    )
-                                },
-                        )
-                    }
-                result.success(services)
+                mainHandler.post { handleServicesDiscovered(deviceId, gatt, status) }
             }
 
             override fun onCharacteristicRead(
@@ -319,12 +274,7 @@ class BleConnection(
                 characteristic: BluetoothGattCharacteristic,
                 status: Int,
             ) {
-                val result = pendingReads.remove(key(deviceId, characteristic)) ?: return
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    result.success(BleUtils.bytesToIntList(characteristic.value))
-                } else {
-                    result.error("operationFailed", "Read failed with status $status", status)
-                }
+                mainHandler.post { handleCharacteristicRead(deviceId, characteristic, status) }
             }
 
             override fun onCharacteristicWrite(
@@ -332,41 +282,119 @@ class BleConnection(
                 characteristic: BluetoothGattCharacteristic,
                 status: Int,
             ) {
-                val result = pendingWrites.remove(key(deviceId, characteristic)) ?: return
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    result.success(null)
-                } else {
-                    result.error("operationFailed", "Write failed with status $status", status)
-                }
+                mainHandler.post { handleCharacteristicWrite(deviceId, characteristic, status) }
             }
 
             override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-                onEvent(
-                    BleUtils.event(
-                        "characteristicValue",
-                        mapOf(
-                            "deviceId" to deviceId,
-                            "serviceUuid" to characteristic.service.uuid.toString(),
-                            "characteristicUuid" to characteristic.uuid.toString(),
-                            "value" to BleUtils.bytesToIntList(characteristic.value),
-                        ),
-                    ),
-                )
+                mainHandler.post { handleCharacteristicChanged(deviceId, characteristic) }
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-                val result = pendingMtu.remove(deviceId) ?: return
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    result.success(mtu)
-                } else {
-                    result.error("operationFailed", "MTU negotiation failed with status $status", status)
-                }
+                mainHandler.post { handleMtuChanged(deviceId, mtu, status) }
             }
         }
 
+    private fun handleConnectionStateChange(deviceId: String, gatt: BluetoothGatt, status: Int, newState: Int) {
+        val state =
+            when (newState) {
+                BluetoothProfile.STATE_CONNECTING -> "connecting"
+                BluetoothProfile.STATE_CONNECTED -> "connected"
+                BluetoothProfile.STATE_DISCONNECTING -> "disconnecting"
+                else -> "disconnected"
+            }
+        onEvent(BleUtils.event("connectionState", mapOf("deviceId" to deviceId, "state" to state)))
+
+        if (newState == BluetoothProfile.STATE_CONNECTED) {
+            clearPendingConnect(deviceId)
+            pendingConnects.remove(deviceId)?.success(null)
+        }
+
+        if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+            try {
+                gatt.close()
+            } catch (e: SecurityException) {
+                // Ignore; the connection is already gone.
+            }
+            gattMap.remove(deviceId)
+
+            clearPendingConnect(deviceId)
+            pendingConnects.remove(deviceId)?.error(
+                "connectionFailed",
+                "Disconnected before connect completed (status $status)",
+                status,
+            )
+
+            clearPendingDisconnect(deviceId)
+            pendingDisconnects.remove(deviceId)?.success(null)
+        }
+    }
+
+    private fun handleServicesDiscovered(deviceId: String, gatt: BluetoothGatt, status: Int) {
+        val result = pendingServiceDiscovery.remove(deviceId) ?: return
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            result.error("operationFailed", "Service discovery failed with status $status", status)
+            return
+        }
+        val services =
+            gatt.services.map { service ->
+                mapOf(
+                    "uuid" to service.uuid.toString(),
+                    "characteristics" to
+                        service.characteristics.map { c ->
+                            mapOf(
+                                "uuid" to c.uuid.toString(),
+                                "canRead" to BleUtils.canRead(c),
+                                "canWrite" to BleUtils.canWrite(c),
+                                "canNotify" to BleUtils.canNotify(c),
+                            )
+                        },
+                )
+            }
+        result.success(services)
+    }
+
+    private fun handleCharacteristicRead(deviceId: String, characteristic: BluetoothGattCharacteristic, status: Int) {
+        val result = pendingReads.remove(key(deviceId, characteristic)) ?: return
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+            result.success(BleUtils.bytesToIntList(characteristic.value))
+        } else {
+            result.error("operationFailed", "Read failed with status $status", status)
+        }
+    }
+
+    private fun handleCharacteristicWrite(deviceId: String, characteristic: BluetoothGattCharacteristic, status: Int) {
+        val result = pendingWrites.remove(key(deviceId, characteristic)) ?: return
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+            result.success(null)
+        } else {
+            result.error("operationFailed", "Write failed with status $status", status)
+        }
+    }
+
+    private fun handleCharacteristicChanged(deviceId: String, characteristic: BluetoothGattCharacteristic) {
+        onEvent(
+            BleUtils.event(
+                "characteristicValue",
+                mapOf(
+                    "deviceId" to deviceId,
+                    "serviceUuid" to characteristic.service.uuid.toString(),
+                    "characteristicUuid" to characteristic.uuid.toString(),
+                    "value" to BleUtils.bytesToIntList(characteristic.value),
+                ),
+            ),
+        )
+    }
+
+    private fun handleMtuChanged(deviceId: String, mtu: Int, status: Int) {
+        val result = pendingMtu.remove(deviceId) ?: return
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+            result.success(mtu)
+        } else {
+            result.error("operationFailed", "MTU negotiation failed with status $status", status)
+        }
+    }
+
     companion object {
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-        private const val CONNECT_TIMEOUT_MS = 10_000L
-        private const val DISCONNECT_TIMEOUT_MS = 5_000L
     }
 }

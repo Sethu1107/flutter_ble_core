@@ -49,11 +49,17 @@ public class FlutterBleCorePlugin: NSObject, FlutterPlugin, FlutterStreamHandler
 
         case "connect":
             guard let deviceId = args?["deviceId"] as? String else { return missingArg(result, "deviceId") }
-            withReady(result) { self.connection!.connect(deviceId: deviceId, result: result) }
+            let connectTimeoutMs = (args?["timeoutMs"] as? Int) ?? Self.defaultConnectTimeoutMs
+            withReady(result) {
+                self.connection!.connect(deviceId: deviceId, timeoutMs: connectTimeoutMs, result: result)
+            }
 
         case "disconnect":
             guard let deviceId = args?["deviceId"] as? String else { return missingArg(result, "deviceId") }
-            withReady(result) { self.connection!.disconnect(deviceId: deviceId, result: result) }
+            let disconnectTimeoutMs = (args?["timeoutMs"] as? Int) ?? Self.defaultDisconnectTimeoutMs
+            withReady(result) {
+                self.connection!.disconnect(deviceId: deviceId, timeoutMs: disconnectTimeoutMs, result: result)
+            }
 
         case "discoverServices":
             guard let deviceId = args?["deviceId"] as? String else { return missingArg(result, "deviceId") }
@@ -176,4 +182,9 @@ public class FlutterBleCorePlugin: NSObject, FlutterPlugin, FlutterStreamHandler
     ) {
         connection?.handleDisconnected(peripheral: peripheral, error: error)
     }
+
+    // Only used if the Dart side omits timeoutMs — BleManager always sends one,
+    // these exist purely so a stale/mismatched Dart binary doesn't misbehave.
+    private static let defaultConnectTimeoutMs = 10_000
+    private static let defaultDisconnectTimeoutMs = 5_000
 }

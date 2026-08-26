@@ -36,7 +36,7 @@ class BleConnection: NSObject, CBPeripheralDelegate {
         discoveredPeripherals[peripheral.identifier.uuidString] = peripheral
     }
 
-    func connect(deviceId: String, result: @escaping FlutterResult) {
+    func connect(deviceId: String, timeoutMs: Int, result: @escaping FlutterResult) {
         guard let uuid = UUID(uuidString: deviceId) else {
             result(FlutterError(code: "connectionFailed", message: "Invalid device id: \(deviceId)", details: nil))
             return
@@ -60,13 +60,13 @@ class BleConnection: NSObject, CBPeripheralDelegate {
             pending(FlutterError(code: "timeout", message: "Timed out connecting to \(deviceId)", details: nil))
         }
         pendingConnectTimeouts[deviceId] = timeoutWork
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.connectTimeoutSeconds, execute: timeoutWork)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(timeoutMs), execute: timeoutWork)
 
         central.connect(peripheral, options: nil)
     }
 
     /// Resolves once the platform confirms disconnection, not merely once it's requested.
-    func disconnect(deviceId: String, result: @escaping FlutterResult) {
+    func disconnect(deviceId: String, timeoutMs: Int, result: @escaping FlutterResult) {
         guard let peripheral = connectedPeripherals[deviceId] else {
             result(nil)
             return
@@ -81,7 +81,7 @@ class BleConnection: NSObject, CBPeripheralDelegate {
             pending(FlutterError(code: "timeout", message: "Timed out disconnecting from \(deviceId)", details: nil))
         }
         pendingDisconnectTimeouts[deviceId] = timeoutWork
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.disconnectTimeoutSeconds, execute: timeoutWork)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(timeoutMs), execute: timeoutWork)
 
         central.cancelPeripheralConnection(peripheral)
     }
@@ -374,7 +374,4 @@ class BleConnection: NSObject, CBPeripheralDelegate {
         guard let error = error else { return nil }
         return (error as NSError).code
     }
-
-    private static let connectTimeoutSeconds: TimeInterval = 10
-    private static let disconnectTimeoutSeconds: TimeInterval = 5
 }
