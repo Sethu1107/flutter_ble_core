@@ -6,10 +6,11 @@ extra runtime dependencies beyond the Flutter SDK.
 
 ## Features
 
-- Scan for nearby BLE devices, with optional service-UUID filtering and an
-  auto-stop timeout
+- Scan for nearby BLE devices, with optional service-UUID filtering, an
+  auto-stop timeout, and a configurable power/speed tradeoff
+  (`startScan(serviceUuids:, timeout:, scanMode:)`)
 - Manufacturer-specific advertisement data and advertised service UUIDs on every
-  scan result
+  scan result (`BleScanResult.manufacturerData`, `.serviceUuids`)
 - Connect / disconnect, with results that wait for the real platform
   confirmation (not just the request being sent) and a configurable timeout
   for each (`BleConfig.connectTimeout`, `disconnect(..., timeout:)`)
@@ -19,10 +20,16 @@ extra runtime dependencies beyond the Flutter SDK.
 - Request a larger ATT MTU (Android; no-op on iOS, which negotiates it
   automatically)
 - Request a connection priority / interval tradeoff (Android; no-op on iOS)
-- Optional auto-reconnect on unexpected disconnects, driven from Dart so the
-  retry policy is identical on both platforms
+- Optional auto-reconnect on unexpected disconnects, with configurable max
+  attempts and delay, driven from Dart so the retry policy is identical on
+  both platforms
 - Structured errors (`BleException`) that carry both a portable `BleErrorCode`
   and, where the platform provides one, the raw native status code
+  (`BleException.platformCode`)
+
+Every retry count, timeout, and power/speed tradeoff above is a parameter —
+nothing meaningful is hardcoded for the developer using this package to
+work around.
 
 ## How Bluetooth is handled per platform
 
@@ -89,10 +96,17 @@ await ble.initialize();
 ble.bluetoothStateStream.listen((state) => print('Adapter: $state'));
 
 // Scan, optionally filtered by service UUID and auto-stopped after a timeout.
+// scanMode trades off discovery speed against battery use (Android only).
 ble.scanResults.listen((result) {
   print('${result.device.name} (${result.device.id}) rssi=${result.rssi}');
+  // Raw manufacturer payload, keyed by company id — parse your own format:
+  final payload = result.manufacturerData[0x004C]; // e.g. company id 0x004C
+  if (payload != null) print('Manufacturer data: $payload');
 });
-await ble.startScan(timeout: const Duration(seconds: 10));
+await ble.startScan(
+  timeout: const Duration(seconds: 10),
+  scanMode: BleScanMode.lowLatency,
+);
 
 // Connect — resolves once the platform confirms the connection, not just
 // once the request is sent. BleConfig also controls auto-reconnect and how
@@ -105,6 +119,14 @@ await ble.connect(
     reconnectDelay: Duration(seconds: 2),
     connectTimeout: Duration(seconds: 10),
   ),
+);
+
+// Optional post-connect tuning — both are Android-only; iOS resolves these
+// immediately as no-ops since CoreBluetooth manages them automatically.
+await ble.requestMtu(deviceId: deviceId, mtu: 512);
+await ble.requestConnectionPriority(
+  deviceId: deviceId,
+  priority: BleConnectionPriority.high,
 );
 
 final services = await ble.discoverServices(deviceId);
