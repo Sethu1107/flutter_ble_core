@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:typed_data';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_ble_core/flutter_ble_core.dart';
 import 'package:permission_handler/permission_handler.dart';
